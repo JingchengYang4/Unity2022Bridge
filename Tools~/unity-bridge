@@ -1,0 +1,318 @@
+#!/bin/zsh
+set -eu
+
+unity_project_path="${UNITY_BRIDGE_PROJECT:-}"
+bridge_directory=''
+token_file=''
+port_file=''
+bridge_token=''
+bridge_port=''
+bridge_url=''
+
+load_bridge_discovery() {
+  local quiet="${1:-false}"
+  if [[ ! -f "$token_file" || ! -f "$port_file" ]]; then
+    if [[ "$quiet" != true ]]; then
+      print -u2 "Unity Editor Bridge is unavailable for $unity_project_path. Open that project in Unity 2022.3 and wait for compilation."
+    fi
+    return 2
+  fi
+
+  bridge_token=$(<"$token_file")
+  bridge_port=$(<"$port_file")
+  if [[ -z "$bridge_token" || "$bridge_port" != <-> ]]; then
+    if [[ "$quiet" != true ]]; then
+      print -u2 "Unity Editor Bridge discovery files are incomplete. Wait for Unity's domain reload to finish."
+    fi
+    return 2
+  fi
+  bridge_url="http://127.0.0.1:$bridge_port"
+}
+
+json_string() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  print -rn -- "\"$value\""
+}
+
+request() {
+  local method="$1"
+  local route="$2"
+  local body="${3:-}"
+  local quiet="${4:-false}"
+  load_bridge_discovery "$quiet" || return $?
+  if [[ -n "$body" ]]; then
+    if ! curl --noproxy 127.0.0.1 --connect-timeout 2 --max-time 35 -sS -X "$method" \
+      -H "X-Limen-Bridge-Token: $bridge_token" \
+      -H "Content-Type: application/json" \
+      --data "$body" \
+      "$bridge_url$route"; then
+      if [[ "$quiet" != true ]]; then
+        print -u2 "Unity Editor Bridge did not respond at $bridge_url. Open $unity_project_path in Unity 2022.3 or wait for its domain reload."
+      fi
+      return 4
+    fi
+  else
+    if ! curl --noproxy 127.0.0.1 --connect-timeout 2 --max-time 35 -sS -X "$method" \
+      -H "X-Limen-Bridge-Token: $bridge_token" \
+      "$bridge_url$route"; then
+      if [[ "$quiet" != true ]]; then
+        print -u2 "Unity Editor Bridge did not respond at $bridge_url. Open $unity_project_path in Unity 2022.3 or wait for its domain reload."
+      fi
+      return 4
+    fi
+  fi
+  print
+}
+
+usage() {
+  print -u2 "usage: unity-bridge [--project UNITY_PROJECT_PATH] <command> [arguments]"
+  print -u2 "commands: status, wait-ready, commands, call, logs, hierarchy, selection, refresh, job, play, menu, scene-open, scene-save, save-all, assets-find"
+  print -u2 "          objects-find, object-get, object-create, object-delete, components, component-add, component-remove, properties"
+  print -u2 "          compile-errors, asset-dependencies, component-types, batch, prefab-inspect, prefab-instance, prefab-instantiate, prefab-save, prefab-apply, prefab-revert, ui-tree"
+  exit "${1:-2}"
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+  usage 0
+fi
+if [[ "${1:-}" == "--project" ]]; then
+  [[ $# -ge 3 ]] || usage
+  unity_project_path="$2"
+  shift 2
+fi
+if [[ -z "$unity_project_path" ]]; then
+  candidate_directory="$PWD"
+  while [[ "$candidate_directory" != / ]]; do
+    if [[ -d "$candidate_directory/ProjectSettings" && -d "$candidate_directory/Assets" ]]; then
+      unity_project_path="$candidate_directory"
+      break
+    fi
+    if [[ -d "$candidate_directory/Limen/ProjectSettings" && -d "$candidate_directory/Limen/Assets" ]]; then
+      unity_project_path="$candidate_directory/Limen"
+      break
+    fi
+    candidate_directory=${candidate_directory:h}
+  done
+fi
+if [[ -z "$unity_project_path" || ! -d "$unity_project_path/ProjectSettings" || ! -d "$unity_project_path/Assets" ]]; then
+  print -u2 "Specify --project or UNITY_BRIDGE_PROJECT with a Unity project containing Assets and ProjectSettings."
+  exit 2
+fi
+unity_project_path=${unity_project_path:A}
+bridge_directory="$unity_project_path/Library/LimenBridge"
+token_file="$bridge_directory/token"
+port_file="$bridge_directory/port"
+
+command_name="${1:-}"
+[[ -n "$command_name" ]] || usage
+shift
+
+case "$command_name" in
+  status)
+    request GET /v1/status
+    ;;
+  wait-ready)
+    timeout_seconds="${1:-120}"
+    [[ "$timeout_seconds" == <-> ]] || usage
+    deadline=$(( SECONDS + timeout_seconds ))
+    while (( SECONDS <= deadline )); do
+      if status_json=$(request GET /v1/status '' true 2>/dev/null); then
+        if [[ "$status_json" == *'"ok":true'* && "$status_json" == *'"isCompiling":false'* && "$status_json" == *'"isUpdating":false'* ]]; then
+          print -r -- "$status_json"
+          exit 0
+        fi
+      fi
+      sleep 1
+    done
+    print -u2 "Timed out waiting for Unity to finish compiling and updating."
+    exit 3
+    ;;
+  commands)
+    request GET /v1/commands
+    ;;
+  call)
+    [[ $# -ge 2 && $# -le 3 ]] || usage
+    request "$1" "$2" "${3:-}"
+    ;;
+  logs)
+    after="${1:-0}"
+    limit="${2:-100}"
+    request GET "/v1/logs?after=$after&limit=$limit"
+    ;;
+  compile-errors)
+    after="${1:-0}"
+    limit="${2:-100}"
+    request GET "/v1/diagnostics/compilation?after=$after&limit=$limit"
+    ;;
+  hierarchy)
+    request GET /v1/scenes/hierarchy
+    ;;
+  selection)
+    request GET /v1/selection
+    ;;
+  refresh)
+    request POST /v1/assets/refresh '{}'
+    ;;
+  job)
+    [[ $# -eq 1 ]] || usage
+    request GET "/v1/jobs/$1"
+    ;;
+  play)
+    [[ $# -eq 1 ]] || usage
+    state=$(json_string "$1")
+    request POST /v1/playmode "{\"state\":$state}"
+    ;;
+  menu)
+    [[ $# -eq 1 ]] || usage
+    menu_path=$(json_string "$1")
+    request POST /v1/menu/execute "{\"path\":$menu_path}"
+    ;;
+  scene-open)
+    [[ $# -ge 1 && $# -le 2 ]] || usage
+    scene_path=$(json_string "$1")
+    additive=false
+    [[ "${2:-}" == "--additive" ]] && additive=true
+    request POST /v1/scenes/open "{\"path\":$scene_path,\"additive\":$additive}"
+    ;;
+  scene-save)
+    request POST /v1/scenes/save '{}'
+    ;;
+  save-all)
+    request POST /v1/save-all '{}'
+    ;;
+  assets-find)
+    [[ $# -ge 1 ]] || usage
+    filter=$(json_string "$1")
+    shift
+    folders='[]'
+    if [[ $# -gt 0 ]]; then
+      folders='['
+      separator=''
+      for folder in "$@"; do
+        folders+="$separator$(json_string "$folder")"
+        separator=','
+      done
+      folders+=']'
+    fi
+    request POST /v1/assets/find "{\"filter\":$filter,\"folders\":$folders,\"limit\":100}"
+    ;;
+  objects-find)
+    [[ $# -le 2 ]] || usage
+    filter=$(json_string "${1:-}")
+    component=$(json_string "${2:-}")
+    request POST /v1/objects/find "{\"filter\":$filter,\"componentType\":$component,\"limit\":100}"
+    ;;
+  object-get)
+    [[ $# -eq 1 ]] || usage
+    object_path=$(json_string "$1")
+    request POST /v1/objects/get "{\"objectPath\":$object_path}"
+    ;;
+  object-create)
+    [[ $# -ge 1 && $# -le 2 ]] || usage
+    object_name=$(json_string "$1")
+    parent_path=$(json_string "${2:-}")
+    request POST /v1/objects/create "{\"name\":$object_name,\"parentPath\":$parent_path}"
+    ;;
+  object-delete)
+    [[ $# -eq 1 ]] || usage
+    object_path=$(json_string "$1")
+    request POST /v1/objects/delete "{\"objectPath\":$object_path}"
+    ;;
+  components)
+    [[ $# -eq 1 ]] || usage
+    object_path=$(json_string "$1")
+    request POST /v1/components/list "{\"objectPath\":$object_path}"
+    ;;
+  component-add)
+    [[ $# -eq 2 ]] || usage
+    object_path=$(json_string "$1")
+    component_type=$(json_string "$2")
+    request POST /v1/components/add "{\"objectPath\":$object_path,\"componentType\":$component_type}"
+    ;;
+  component-remove)
+    [[ $# -ge 2 && $# -le 3 ]] || usage
+    object_path=$(json_string "$1")
+    component_type=$(json_string "$2")
+    component_index="${3:-0}"
+    request POST /v1/components/remove "{\"objectPath\":$object_path,\"componentType\":$component_type,\"componentIndex\":$component_index}"
+    ;;
+  properties)
+    [[ $# -ge 2 && $# -le 4 ]] || usage
+    object_path=$(json_string "$1")
+    component_type=$(json_string "$2")
+    component_index="${3:-0}"
+    filter=$(json_string "${4:-}")
+    request POST /v1/properties/get "{\"objectPath\":$object_path,\"componentType\":$component_type,\"componentIndex\":$component_index,\"filter\":$filter}"
+    ;;
+  asset-dependencies)
+    [[ $# -ge 1 && $# -le 2 ]] || usage
+    asset_path=$(json_string "$1")
+    mode="${2:-direct}"
+    recursive=false
+    reverse=false
+    [[ "$mode" == "recursive" ]] && recursive=true
+    [[ "$mode" == "reverse" ]] && reverse=true
+    [[ "$mode" == "direct" || "$mode" == "recursive" || "$mode" == "reverse" ]] || usage
+    request POST /v1/assets/dependencies "{\"assetPath\":$asset_path,\"recursive\":$recursive,\"reverse\":$reverse,\"limit\":100}"
+    ;;
+  component-types)
+    [[ $# -le 1 ]] || usage
+    filter=$(json_string "${1:-}")
+    request POST /v1/types/components "{\"filter\":$filter,\"limit\":100}"
+    ;;
+  batch)
+    [[ $# -eq 1 ]] || usage
+    request POST /v1/batch "$1"
+    ;;
+  prefab-inspect)
+    [[ $# -eq 1 ]] || usage
+    asset_path=$(json_string "$1")
+    request POST /v1/prefabs/inspect "{\"assetPath\":$asset_path,\"limit\":100}"
+    ;;
+  prefab-instance)
+    [[ $# -eq 1 ]] || usage
+    object_path=$(json_string "$1")
+    request POST /v1/prefabs/instance "{\"objectPath\":$object_path}"
+    ;;
+  prefab-instantiate)
+    [[ $# -ge 1 && $# -le 2 ]] || usage
+    asset_path=$(json_string "$1")
+    parent_path=$(json_string "${2:-}")
+    request POST /v1/prefabs/instantiate "{\"assetPath\":$asset_path,\"parentPath\":$parent_path}"
+    ;;
+  prefab-save)
+    [[ $# -ge 2 && $# -le 3 ]] || usage
+    object_path=$(json_string "$1")
+    asset_path=$(json_string "$2")
+    overwrite=false
+    [[ "${3:-}" == "--overwrite" ]] && overwrite=true
+    request POST /v1/prefabs/save "{\"objectPath\":$object_path,\"assetPath\":$asset_path,\"overwrite\":$overwrite}"
+    ;;
+  prefab-apply)
+    [[ $# -eq 1 ]] || usage
+    object_path=$(json_string "$1")
+    request POST /v1/prefabs/apply "{\"objectPath\":$object_path}"
+    ;;
+  prefab-revert)
+    [[ $# -eq 1 ]] || usage
+    object_path=$(json_string "$1")
+    request POST /v1/prefabs/revert "{\"objectPath\":$object_path}"
+    ;;
+  ui-tree)
+    [[ $# -ge 1 && $# -le 2 ]] || usage
+    filter=$(json_string "${2:-}")
+    if [[ "$1" == Assets/*.uxml ]]; then
+      asset_path=$(json_string "$1")
+      request POST /v1/ui-toolkit/tree "{\"assetPath\":$asset_path,\"filter\":$filter,\"limit\":250}"
+    else
+      object_path=$(json_string "$1")
+      request POST /v1/ui-toolkit/tree "{\"objectPath\":$object_path,\"filter\":$filter,\"limit\":250}"
+    fi
+    ;;
+  *)
+    usage
+    ;;
+esac

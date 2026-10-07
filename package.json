@@ -1,0 +1,10 @@
+{
+  "name": "com.limen.editor-bridge",
+  "version": "0.4.0",
+  "displayName": "Unity Editor Bridge",
+  "description": "An Editor-only, authenticated loopback bridge with typed Unity 2022.3 operations and a project-aware shell client.",
+  "unity": "2022.3",
+  "author": {
+    "name": "Limen"
+  }
+}

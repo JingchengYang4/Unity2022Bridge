@@ -1,0 +1,16 @@
+.DS_Store
+
+# Unity-generated project data and bridge discovery credentials.
+/Library/
+/Temp/
+/Obj/
+/Logs/
+/UserSettings/
+/Build/
+/Builds/
+
+# Generated IDE project files.
+*.csproj
+*.sln
+*.suo
+*.user
